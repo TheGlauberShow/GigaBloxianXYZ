@@ -1,59 +1,69 @@
 #include "instance_manager.h"
-#include "instance_detector.h"
-#include "cpu_affinity.h"
+#include <TlHelp32.h>
 
-#include <thread>
-#include <atomic>
-#include <vector>
-#include <algorithm>
+static std::vector<RobloxInstance> g_instances;
+static HANDLE g_thread;
+static bool g_running = false;
 
-static std::atomic<bool> running = false;
-static std::thread worker;
+static BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    DWORD pid;
+    GetWindowThreadProcessId(hwnd, &pid);
 
-static DWORD_PTR GetAllCoresMask() {
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    return (1ULL << si.dwNumberOfProcessors) - 1;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return TRUE;
+
+    PROCESSENTRY32 pe{};
+    pe.dwSize = sizeof(pe);
+
+    if (Process32First(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == pid) {
+                if (wcscmp(pe.szExeFile, L"RobloxPlayerBeta.exe") == 0) {
+                    RobloxInstance inst{};
+                    inst.pid = pid;
+                    inst.hwnd = hwnd;
+                    inst.isPrimary = false;
+
+                    g_instances.push_back(inst);
+                }
+                break;
+            }
+        } while (Process32Next(snap, &pe));
+    }
+
+    CloseHandle(snap);
+    return TRUE;
 }
 
-void Loop() {
-    DWORD_PTR allCores = GetAllCoresMask();
-
-    while (running) {
-        auto pids = InstanceDetector::GetRobloxPIDs();
-
-        if (!pids.empty()) {
-            std::sort(pids.begin(), pids.end());
-
-            DWORD mainPid = pids[0];
-
-            // MAIN instance
-            CpuAffinity::SetPriority(mainPid, HIGH_PRIORITY_CLASS);
-            CpuAffinity::SetAffinity(mainPid, allCores);
-
-            // ALT instances
-            for (size_t i = 1; i < pids.size(); i++) {
-                CpuAffinity::SetPriority(pids[i], BELOW_NORMAL_PRIORITY_CLASS);
-
-                // Limita ALT a metade dos cores
-                DWORD_PTR mask = allCores >> 1;
-                if (mask == 0) mask = 1;
-                CpuAffinity::SetAffinity(pids[i], mask);
-            }
-        }
-
-        Sleep(3000); // atualiza a cada 3 segundos
+static DWORD WINAPI ScanThread(LPVOID) {
+    while (g_running) {
+        g_instances.clear();
+        EnumWindows(EnumWindowsProc, 0);
+        Sleep(2000); // escaneia a cada 2s
     }
+    return 0;
 }
 
 void InstanceManager::Start() {
-    if (running) return;
-    running = true;
-    worker = std::thread(Loop);
+    g_running = true;
+    g_thread = CreateThread(nullptr, 0, ScanThread, nullptr, 0, nullptr);
 }
 
 void InstanceManager::Stop() {
-    running = false;
-    if (worker.joinable())
-        worker.join();
+    g_running = false;
+    if (g_thread) {
+        WaitForSingleObject(g_thread, INFINITE);
+        CloseHandle(g_thread);
+        g_thread = nullptr;
+    }
+}
+
+const std::vector<RobloxInstance>& InstanceManager::GetInstances() {
+    return g_instances;
+}
+
+void InstanceManager::SetPrimary(DWORD pid) {
+    for (auto& inst : g_instances) {
+        inst.isPrimary = (inst.pid == pid);
+    }
 }
